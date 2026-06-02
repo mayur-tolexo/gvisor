@@ -115,8 +115,10 @@ pkg_tar(
         "_config.yml",
         ":css",
         "//website/blog:index.html",
+        "//website/saves:index.html",
         "//website/users:index.html",
     ] + glob([
+        "_data/**",
         "assets/**",
         "_includes/**",
         "_layouts/**",
