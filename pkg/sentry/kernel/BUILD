@@ -251,6 +251,7 @@ go_library(
         "atomicptr_bucket_unsafe.go",
         "atomicptr_descriptor_unsafe.go",
         "cgroup.go",
+        "cgroup2.go",
         "cgroup_mounts_mutex.go",
         "cgroup_mutex.go",
         "context.go",

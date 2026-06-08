@@ -129,6 +129,12 @@ type TaskConfig struct {
 	// Used by clone3 to support CLONE_PIDFD.
 	pidFDMode pidFDMode
 	pidFDAddr hostarch.Addr
+
+	// cgroupFD is the CLONE_INTO_CGROUP file descriptor. Valid only if
+	// cloneIntoCgroup is true.
+	cgroupFD uint64
+	// Set only if CLONE_INTO_CGROUP is passed to clone.
+	cloneIntoCgroup bool
 }
 
 // NewTask creates a new task defined by cfg.
@@ -177,6 +183,32 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, int32, 
 	srcT := TaskFromContext(ctx)
 	tg := cfg.ThreadGroup
 	image := cfg.TaskImage
+
+	var cu cleanup.Cleanup
+	defer cu.Clean()
+
+	var cgroup2 Cgroup2
+	switch {
+	case cfg.cloneIntoCgroup:
+		c, err := srcT.getCgroup2NodeFromFD(cfg.cgroupFD)
+		if err != nil {
+			return nil, -1, err
+		}
+		srcT.k.Cgroup2FS().RLockTree()
+		cu.Add(func() {
+			srcT.k.Cgroup2FS().RUnlockTree()
+		})
+		if err := c.CanCloneInto(ctx, srcT.Credentials()); err != nil {
+			return nil, -1, err
+		}
+		cgroup2 = c
+	case srcT != nil:
+		cgroup2 = srcT.Cgroup2()
+	default:
+		cgroup2 = cfg.Kernel.Cgroup2FS().RootCgroup()
+	}
+	cachedKillSeq := cgroup2.KillSeq()
+
 	t := &Task{
 		taskNode: taskNode{
 			tg:       tg,
@@ -209,6 +241,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, int32, 
 		Origin:          cfg.Origin,
 		onDestroyAction: make(map[TaskDestroyAction]struct{}),
 		noNewPrivs:      cfg.NoNewPrivs,
+		cgroup2:         cgroup2,
 	}
 	t.netns = cfg.NetworkNamespace
 	t.creds.Store(cfg.Credentials)
@@ -217,11 +250,7 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, int32, 
 	// We don't construct t.blockingTimer until Task.run(); see that function
 	// for justification.
 
-	var cu cleanup.Cleanup
-	defer cu.Clean()
-
 	pidFD := int32(-1)
-
 	if cfg.pidFDMode != dontMakePIDFD {
 		isThread := cfg.pidFDMode == makeThreadedPIDFD
 		t.pid = &pid{}
@@ -249,35 +278,27 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, int32, 
 		}
 	}
 
-	var (
-		cg                 Cgroup
-		charged, committed bool
-	)
+	if !cgroup2.CanEnter(ctx, t) {
+		return nil, -1, linuxerr.EAGAIN
+	}
+	cu.Add(func() {
+		cgroup2.CancelEnter(ctx, t)
+	})
 
 	// Reserve cgroup PIDs controller charge. This is either committed when the
 	// new task enters the cgroup below, or rolled back on failure.
-	//
 	// We may also get here from a non-task context (for example, when
 	// creating the init task, or from the exec control command). In these cases
 	// we skip charging the pids controller, as non-userspace task creation
 	// bypasses pid limits.
+	var commitCgroupV1Charge func()
 	if srcT != nil {
-		var err error
-		if charged, cg, err = srcT.ChargeFor(t, CgroupControllerPIDs, CgroupResourcePID, 1); err != nil {
+		abort, commit, err := srcT.chargeCgroupV1PIDs(ctx, t)
+		if err != nil {
 			return nil, -1, err
 		}
-		if charged {
-			defer func() {
-				if !committed {
-					if err := cg.Charge(t, cg.Dentry, CgroupControllerPIDs, CgroupResourcePID, -1); err != nil {
-						panic(fmt.Sprintf("Failed to clean up PIDs charge on task creation failure: %v", err))
-					}
-				}
-				// Ref from ChargeFor. Note that we need to drop this outside of
-				// TaskSet.mu critical sections.
-				cg.DecRef(ctx)
-			}()
-		}
+		cu.Add(abort)
+		commitCgroupV1Charge = commit
 	}
 
 	// If the task was the first to be added to the thread group, check if
@@ -315,6 +336,11 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, int32, 
 	}
 	// Below this point, newTask is expected not to fail (there is no rollback
 	// of assignTIDsLocked or any of the following).
+	cu.Release()
+	if commitCgroupV1Charge != nil {
+		// Can't do this with the TaskSet mutex held.
+		go commitCgroupV1Charge()
+	}
 
 	ts.liveTasks++
 
@@ -335,7 +361,12 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, int32, 
 	// be placed in the srcT's cgroups. If neither is specified, the new task
 	// will be in the root cgroups.
 	t.EnterInitialCgroups(srcT, cfg.InitialCgroups)
-	committed = true
+
+	t.cgroup2.Enter(ctx, t)
+	if cfg.cloneIntoCgroup {
+		// Unlock the cgroup v2 treeMu now that the task is in the desired cgroup.
+		t.k.Cgroup2FS().RUnlockTree()
+	}
 
 	if isFirstTask = tg.leader == nil; isFirstTask {
 		// New thread group.
@@ -374,7 +405,11 @@ func (ts *TaskSet) newTask(ctx context.Context, cfg *TaskConfig) (*Task, int32, 
 	// other pieces to be initialized as the task is used the context.
 	t.p = cfg.Kernel.Platform.NewContext(t.AsyncContext())
 
-	cu.Release()
+	// We raced with a cgroup.kill write.
+	if t.cgroup2.KillSeq() != cachedKillSeq {
+		t.sendSignalLocked(SignalInfoPriv(linux.SIGKILL), false /* group */)
+	}
+
 	return t, pidFD, nil
 }
 

@@ -1607,11 +1607,14 @@ func (d *taskCgroupData) Generate(ctx context.Context, buf *bytes.Buffer) error 
 	// doesn't move them into an initial cgroup set, so partway through task
 	// exit this file show a task is in no cgroups, which is incorrect. Instead,
 	// once a task has left its cgroups, we return an error.
-	if d.task.ExitState() >= kernel.TaskExitInitiated {
+	if d.task.ExitState() >= kernel.TaskExitInitiated && !kernel.KernelFromContext(ctx).Cgroup2FS().EverMounted() {
 		return linuxerr.ESRCH
 	}
 
 	d.task.GenerateProcTaskCgroup(buf)
+	if cg2Entry := d.task.GetCgroup2Entry(); cg2Entry != nil {
+		fmt.Fprintf(buf, "0::%s\n", cg2Entry.Path)
+	}
 	return nil
 }
 
