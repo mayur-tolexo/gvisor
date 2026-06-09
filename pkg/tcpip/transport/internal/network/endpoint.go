@@ -276,19 +276,27 @@ func (c *WriteContext) PacketInfo() WritePacketInfo {
 func (c *WriteContext) TryNewPacketBuffer(reserveHdrBytes int, data buffer.Buffer) *stack.PacketBuffer {
 	e := c.e
 
+	e.mu.RLock()
+	mark := e.ops.GetMark()
+	e.mu.RUnlock()
+
 	e.sendBufferSizeInUseMu.Lock()
 	defer e.sendBufferSizeInUseMu.Unlock()
 
 	if !e.hasSendSpaceRLocked() {
 		return nil
 	}
-	return c.newPacketBufferLocked(reserveHdrBytes, data)
+	return c.newPacketBufferLocked(reserveHdrBytes, data, mark)
 }
 
 // TryNewPacketBufferFromPayloader returns a new packet buffer if the endpoint's send buffer
 // is not full. Otherwise, data from `payloader` isn't read.
 func (c *WriteContext) TryNewPacketBufferFromPayloader(reserveHdrBytes int, payloader tcpip.Payloader) (*stack.PacketBuffer, tcpip.Error) {
 	e := c.e
+
+	e.mu.RLock()
+	mark := e.ops.GetMark()
+	e.mu.RUnlock()
 
 	e.sendBufferSizeInUseMu.Lock()
 	defer e.sendBufferSizeInUseMu.Unlock()
@@ -301,11 +309,11 @@ func (c *WriteContext) TryNewPacketBufferFromPayloader(reserveHdrBytes int, payl
 		data.Release()
 		return nil, &tcpip.ErrBadBuffer{}
 	}
-	return c.newPacketBufferLocked(reserveHdrBytes, data), nil
+	return c.newPacketBufferLocked(reserveHdrBytes, data, mark), nil
 }
 
 // +checklocks:c.e.sendBufferSizeInUseMu
-func (c *WriteContext) newPacketBufferLocked(reserveHdrBytes int, data buffer.Buffer) *stack.PacketBuffer {
+func (c *WriteContext) newPacketBufferLocked(reserveHdrBytes int, data buffer.Buffer, mark uint32) *stack.PacketBuffer {
 	e := c.e
 	// Note that we allow oversubscription - if there is any space at all in the
 	// send buffer, we accept the full packet which may be larger than the space
@@ -328,6 +336,7 @@ func (c *WriteContext) newPacketBufferLocked(reserveHdrBytes int, data buffer.Bu
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: reserveHdrBytes,
 		Payload:            data,
+		Mark:               mark,
 		OnRelease: func() {
 			e.sendBufferSizeInUseMu.Lock()
 			if got := e.sendBufferSizeInUse; got < pktSize {
