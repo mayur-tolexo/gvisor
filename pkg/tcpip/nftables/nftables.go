@@ -597,6 +597,8 @@ func (nf *NFTables) AddTable(family stack.AddressFamily, name string,
 		flagSet:       make(map[TableFlag]struct{}),
 		handle:        nf.getNewTableHandle(),
 		handleCounter: atomicbitops.Uint64{},
+		sets:          make(map[string]*nftSet),
+		setHandles:    make(map[uint64]*nftSet),
 	}
 	tableMap[name] = t
 	tableHandleMap[t.handle] = t
@@ -1373,7 +1375,7 @@ func (r *Rule) AddOpFromExprInfo(tab *Table, exprInfo ExprInfo) *syserr.Annotate
 			return err
 		}
 	case OpTypeCounter:
-		if op, err = initCounter(tab, exprInfo); err != nil {
+		if op, err = initCounter(exprInfo); err != nil {
 			return err
 		}
 	case OpTypeNAT:
