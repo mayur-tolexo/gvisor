@@ -730,6 +730,27 @@ TEST(OpenTreeTest, OpenTreeCloneNonRecursiveOnAttached) {
               SyscallFailsWithErrno(ENOENT));
 }
 
+TEST(OpenTreeTest, OpenTreeCloneFailsOnDetachedMount) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath path1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  Cleanup mount_cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", path1.path().c_str(), kTmpfs, 0, "", MNT_DETACH));
+
+  int fd = open(path1.path().c_str(), O_PATH | O_DIRECTORY);
+  ASSERT_THAT(fd, SyscallSucceeds());
+  auto cleanup_fd = Cleanup([&]() { close(fd); });
+
+  // Detach the mount now that we hold an O_PATH reference to it.
+  mount_cleanup.Release()();
+
+  // open_tree(OPEN_TREE_CLONE) on a mount that has already been detached via
+  // MNT_DETACH must fail with EINVAL, matching Linux. Regression test for
+  // CloneTreeToAnonNS() not checking Mount.umounted (gvisor.dev/issue/13481).
+  EXPECT_THAT(open_tree(fd, "", AT_EMPTY_PATH | OPEN_TREE_CLONE),
+              SyscallFailsWithErrno(EINVAL));
+}
+
 TEST(OpenTreeTest, OpenTreeCloneNonRecursiveOnDetached) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
