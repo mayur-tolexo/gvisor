@@ -63,6 +63,7 @@ go_library(
         "directory.go",
         "file.go",
         "fusefs.go",
+        "host_connection.go",
         "inode.go",
         "inode_connection.go",
         "inode_refs.go",
@@ -110,12 +111,15 @@ go_test(
     srcs = [
         "connection_test.go",
         "dev_test.go",
+        "host_connection_integration_test.go",
+        "host_connection_test.go",
         "utils_test.go",
     ],
     library = ":fuse",
     deps = [
         "//pkg/abi/linux",
         "//pkg/errors/linuxerr",
+        "//pkg/hostarch",
         "//pkg/marshal/primitive",
         "//pkg/sentry/fsimpl/testutil",
         "//pkg/sentry/kernel",

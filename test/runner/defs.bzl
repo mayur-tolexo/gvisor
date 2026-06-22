@@ -76,6 +76,7 @@ def _syscall_test(
         container = None,
         one_sandbox = True,
         fusefs = False,
+        fuse_host = False,
         directfs = False,
         leak_check = False,
         save = False,
@@ -97,6 +98,8 @@ def _syscall_test(
         name += "_" + network + "net"
     if fusefs:
         name += "_fuse"
+    if fuse_host:
+        name += "_fuse_host"
     if directfs:
         name += "_directfs"
     if save:
@@ -163,6 +166,7 @@ def _syscall_test(
         "--network=" + network,
         "--use-tmpfs=" + str(use_tmpfs),
         "--fusefs=" + str(fusefs),
+        "--fuse-host=" + str(fuse_host),
         "--file-access=" + file_access,
         "--overlay=" + str(overlay),
         "--add-host-uds=" + str(add_host_uds),
@@ -227,6 +231,7 @@ def syscall_test_variants(
         overlay = False,
         netstack_sr = False,
         nftables = False,
+        add_fuse_host = False,
         kvm_use_cpu_nums = False,
         **kwargs):
     """Generates syscall tests for all variants.
@@ -390,11 +395,28 @@ def syscall_test_variants(
             kvm_use_cpu_nums = kvm_use_cpu_nums,
             **kwargs
         )
+    if add_fuse_host:
+        _syscall_test(
+            test = test,
+            platform = default_platform,
+            use_tmpfs = True,
+            fuse_host = True,
+            tags = platforms.get(default_platform, []) + tags,
+            debug = debug,
+            container = container,
+            one_sandbox = one_sandbox,
+            leak_check = leak_check,
+            size = size,
+            timeout = timeout,
+            kvm_use_cpu_nums = kvm_use_cpu_nums,
+            **kwargs
+        )
 
 def syscall_test(
         test,
         use_tmpfs = False,
         add_fusefs = False,
+        add_fuse_host = False,
         add_overlay = False,
         add_host_uds = False,
         add_host_connector = False,
@@ -501,6 +523,7 @@ def syscall_test(
         overlay = overlay,
         netstack_sr = False,
         nftables = nftables,
+        add_fuse_host = add_fuse_host,
         kvm_use_cpu_nums = kvm_use_cpu_nums,
         **kwargs
     )

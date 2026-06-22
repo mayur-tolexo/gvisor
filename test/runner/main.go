@@ -58,6 +58,7 @@ var (
 	network            = flag.String("network", "none", "network stack to run on (sandbox, host, none)")
 	useTmpfs           = flag.Bool("use-tmpfs", false, "mounts tmpfs for /tmp")
 	fusefs             = flag.Bool("fusefs", false, "mounts a fusefs for /tmp")
+	fuseHost           = flag.Bool("fuse-host", false, "mounts a fusefs backed by a host-side FUSE server communicating over a socketpair")
 	fileAccess         = flag.String("file-access", "exclusive", "mounts root in exclusive or shared mode")
 	overlay            = flag.Bool("overlay", false, "wrap filesystem mounts with writable tmpfs overlay")
 	container          = flag.Bool("container", false, "run tests in their own namespaces (user ns, network ns, etc), pretending to be root. Implicitly enabled if network=host, or if using network namespaces")
@@ -92,6 +93,14 @@ const (
 	// hostPTYHostFD is the FD number on the host that is passed to the sandbox.
 	// FDs passed via ExtraFiles start at 3.
 	hostPTYHostFD = 3
+
+	// fuseHostGuestFD is the FD number inside the sandbox for the host FUSE
+	// socketpair end.
+	fuseHostGuestFD = 101
+
+	// fuseHostHostFD is the FD number on the host for the sandbox-side
+	// socketpair end. If hostPTY is also used, this shifts to 4.
+	fuseHostHostFDBase = 3
 
 	// uniqueXMLSuffix is the suffix for individual per-testcase XML outputs.
 	uniqueXMLSuffix = ".unique.xml"
@@ -351,6 +360,59 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		spec.Process.Env = append(spec.Process.Env, fmt.Sprintf("TEST_HOST_PTY_FD=%d", hostPTYGuestFD))
 	}
 
+	var fuseHostFile *os.File
+	if *fuseHost {
+		fuseHostServerBin, err := testutil.FindFile("test/runner/fuse_host/fuse_host")
+		if err != nil {
+			return fmt.Errorf("cannot find fuse_host: %v", err)
+		}
+
+		fuseHostBackDir, err := os.MkdirTemp(testutil.TmpDir(), "fuse-host-back")
+		if err != nil {
+			return fmt.Errorf("could not create fuse host backing dir: %v", err)
+		}
+		defer os.RemoveAll(fuseHostBackDir)
+		if err := os.Chmod(fuseHostBackDir, 0777); err != nil {
+			return fmt.Errorf("could not chmod fuse host backing dir: %v", err)
+		}
+
+		fuseHostTestData := "hello from the host FUSE server\n"
+		if err := os.WriteFile(filepath.Join(fuseHostBackDir, "testfile"), []byte(fuseHostTestData), 0644); err != nil {
+			return fmt.Errorf("could not create fuse host test file: %v", err)
+		}
+
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("socketpair for fuse_host: %v", err)
+		}
+		fuseHostFile = os.NewFile(uintptr(fds[0]), "fuse-host-sandbox")
+		serverFile := os.NewFile(uintptr(fds[1]), "fuse-host-server")
+
+		fuseHostServerCmd := exec.Command(fuseHostServerBin,
+			fmt.Sprintf("--back-dir=%s", fuseHostBackDir),
+			"--fd=3",
+		)
+		fuseHostServerCmd.ExtraFiles = []*os.File{serverFile}
+		fuseHostServerCmd.Stdout = os.Stdout
+		fuseHostServerCmd.Stderr = os.Stderr
+		if err := fuseHostServerCmd.Start(); err != nil {
+			fuseHostFile.Close()
+			serverFile.Close()
+			return fmt.Errorf("could not start fuse_host server: %v", err)
+		}
+		serverFile.Close()
+		defer func() {
+			fuseHostFile.Close()
+			fuseHostServerCmd.Process.Kill()
+			fuseHostServerCmd.Wait()
+		}()
+
+		spec.Process.Env = append(spec.Process.Env,
+			fmt.Sprintf("GVISOR_FUSE_HOST_TEST=TRUE"),
+			fmt.Sprintf("GVISOR_FUSE_HOST_FD=%d", fuseHostGuestFD),
+		)
+	}
+
 	bundleDir, cleanup, err := testutil.SetupBundleDir(spec)
 	if err != nil {
 		return fmt.Errorf("SetupBundleDir failed: %v", err)
@@ -554,12 +616,23 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 		if hostTTYFile != nil {
 			cmdArgs = append(cmdArgs, fmt.Sprintf("--pass-fd=%d:%d", hostPTYHostFD, hostPTYGuestFD))
 		}
+		if fuseHostFile != nil {
+			// The host FD number is 3 + number of ExtraFiles already added.
+			fuseHostHostFD := fuseHostHostFDBase
+			if hostTTYFile != nil {
+				fuseHostHostFD++
+			}
+			cmdArgs = append(cmdArgs, fmt.Sprintf("--pass-fd=%d:%d", fuseHostHostFD, fuseHostGuestFD))
+		}
 		cmdArgs = append(cmdArgs, "--bundle", bundleDir, id)
 	}
 	log.Infof("Executing: %v", append([]string{specutils.ExePath}, cmdArgs...))
 	cmd := exec.Command(specutils.ExePath, cmdArgs...)
 	if hostTTYFile != nil && *waitForPid == 0 {
 		cmd.ExtraFiles = append(cmd.ExtraFiles, hostTTYFile)
+	}
+	if fuseHostFile != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, fuseHostFile)
 	}
 	cmd.SysProcAttr = sysProcAttr
 	if *container || *network == "host" || (cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
@@ -977,6 +1050,7 @@ func runTestCaseRunsc(testBin string, tc *gtest.TestCase, args []string, t *test
 			Type:        "tmpfs",
 		})
 	}
+
 	if *network == "host" && !testutil.TestEnvSupportsNetAdmin {
 		log.Warningf("Testing with network=host but test environment does not support net admin or raw sockets. Dropping CAP_NET_ADMIN and CAP_NET_RAW.")
 		specutils.DropCapability(spec.Process.Capabilities, "CAP_NET_ADMIN")

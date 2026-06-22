@@ -280,6 +280,11 @@ syscall_test(
 )
 
 syscall_test(
+    add_fuse_host = True,
+    test = "//test/syscalls/linux:fuse_host_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:getcpu_host_test",
 )
 

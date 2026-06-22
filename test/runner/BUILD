@@ -12,6 +12,7 @@ go_binary(
     data = [
         "//runsc",
         "//test/runner/fuse",
+        "//test/runner/fuse_host",
         "//test/runner/setup_container",
     ],
     visibility = ["//:sandbox"],
