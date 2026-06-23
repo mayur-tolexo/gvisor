@@ -9,6 +9,7 @@ go_test(
     name = "shim_test",
     srcs = ["shim_test.go"],
     deps = [
+        "//runsc/specutils",
         "//shim/shimutils",
         "@com_github_containerd_containerd_api//runtime/task/v2:go_default_library",
         "@com_github_containerd_containerd_api//types/task:go_default_library",
