@@ -184,6 +184,16 @@ func UpdateVolumeAnnotations(s *specs.Spec) (bool, error) {
 			}
 			s.Annotations[volumeSourceKey(volume)] = path
 			if strings.Contains(path, emptyDirVolumesDir) {
+				// Operator opted this emptyDir into a shared, disk-backed tmpfs overlay
+				// by pre-setting share=pod. Keep the OCI mount a bind (disk filestore) and
+				// only fix the hint type, so gVisor builds one SelfOverlay master across
+				// the pod's containers that runsc checkpoint captures; the kubelet still
+				// owns the emptyDir.
+				if s.Annotations[volumeShareKey(volume)] == "pod" {
+					s.Annotations[k] = "tmpfs"
+					updated = true
+					continue
+				}
 				forceShared := emptyDirForceShared(s.Annotations, volume)
 				empty := isEmptyDirEmpty(path)
 				if !forceShared && empty {
@@ -220,6 +230,11 @@ func UpdateVolumeAnnotations(s *specs.Spec) (bool, error) {
 				// matching.
 				if yes, _ := isVolumePath(volume, s.Mounts[i].Source); yes {
 					if strings.Contains(s.Mounts[i].Source, emptyDirVolumesDir) {
+						// Pod-shared overlay emptyDir: keep the bind mount so its upper stays
+						// a disk-backed tmpfs (see the sandbox branch).
+						if s.Annotations[volumeShareKey(volume)] == "pod" {
+							continue
+						}
 						forceShared := emptyDirForceShared(s.Annotations, volume)
 						empty := isEmptyDirEmpty(s.Mounts[i].Source)
 						if forceShared || !empty {
