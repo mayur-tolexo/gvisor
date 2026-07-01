@@ -1475,8 +1475,10 @@ func (c *containerMounter) makeMountPoint(
 }
 
 // configureRestore returns an updated context.Context including filesystem
-// state used by restore defined by conf.
-func (c *containerMounter) configureRestore(fdmap map[checkpoint.ResourceID]int, mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile) error {
+// state used by restore defined by conf. sharedMFSources tracks pod-shared
+// overlay hint sources already registered, so peer containers reuse the owner's
+// MemoryFile instead of adding a duplicate.
+func (c *containerMounter) configureRestore(fdmap map[checkpoint.ResourceID]int, mfmap map[checkpoint.ResourceID]*pgalloc.MemoryFile, sharedMFSources map[string]struct{}) error {
 	// Compare createMountNamespace(); rootfs always consumes a gofer FD and a
 	// filestore FD is consumed if the rootfs GoferMountConf indicates so.
 	rootKey := checkpoint.ResourceID{ContainerName: c.containerName, Path: "/"}
@@ -1501,6 +1503,19 @@ func (c *containerMounter) configureRestore(fdmap map[checkpoint.ResourceID]int,
 			fdmap[key] = submount.goferFD.Release()
 		}
 		if submount.filestoreFD != nil {
+			// A pod-shared overlay is one MemoryFile owned by the first container
+			// to mount it; peers reuse that master (see getSharedMount) and saved no
+			// MemoryFile of their own, so skip the peer's duplicate and close its
+			// extra filestore FD to keep mfmap matching the saved owners. Relies on
+			// the original container ordering, as the ResourceID keys already do.
+			if submount.hint != nil && submount.hint.ShouldShareMount() {
+				src := submount.hint.Mount.Source
+				if _, ok := sharedMFSources[src]; ok {
+					submount.filestoreFD.Close()
+					continue
+				}
+				sharedMFSources[src] = struct{}{}
+			}
 			key := checkpoint.ResourceID{ContainerName: c.containerName, Path: submount.mount.Destination}
 			mf, err := createPrivateMemoryFile(submount.filestoreFD.ReleaseToFile("overlay-filestore"), key, c.containerID, c.l.fsRestore)
 			if err != nil {
