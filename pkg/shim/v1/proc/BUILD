@@ -49,6 +49,7 @@ go_test(
     name = "proc_test",
     size = "small",
     srcs = [
+        "delete_test.go",
         "init_kill_test.go",
         "init_runtime_test.go",
         "init_state_test.go",
