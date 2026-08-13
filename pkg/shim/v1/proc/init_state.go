@@ -74,6 +74,7 @@ func (s *createdState) transition(transition stateTransition) {
 	case running:
 		s.p.initState = &runningState{p: s.p}
 	case stopped:
+		s.p.closeUnstartedIO()
 		s.p.initState = &stoppedState{process: s.p}
 	case deleted:
 		s.p.initState = &deletedState{}
@@ -91,10 +92,7 @@ func (s *createdState) Start(ctx context.Context, restoreConf *extension.Restore
 		// To work around that, we treat non-root container in start/restore
 		// failure state as stopped.
 		if !s.p.Sandbox {
-			// p.io is nil when the process was created with a terminal.
-			if s.p.io != nil {
-				s.p.io.Close()
-			}
+			// The transition to "stopped" closes the stdio.
 			s.p.setExited(InternalErrorCode)
 			s.transition(stopped)
 		}
@@ -105,11 +103,25 @@ func (s *createdState) Start(ctx context.Context, restoreConf *extension.Restore
 }
 
 func (s *createdState) Delete(ctx context.Context) error {
+	// Deleting from "created" never passes through the stopped transition.
+	s.p.closeUnstartedIO()
 	if err := s.p.delete(ctx); err != nil {
 		return err
 	}
 	s.transition(deleted)
 	return nil
+}
+
+// closeUnstartedIO releases the stdio of a sub-container that never started.
+// It never ran, so it has no output to lose, and the shim holds the write ends
+// of its pipes itself until a start succeeds: left open, copyPipes never sees
+// EOF and Init.delete's drain runs out its whole deadline and fails. Not for
+// the sandbox, whose write ends belong to the sandbox process and may still
+// carry its last output, nor for a container that ran.
+func (p *Init) closeUnstartedIO() {
+	if !p.Sandbox {
+		p.closeIO()
+	}
 }
 
 func (s *createdState) Kill(ctx context.Context, sig uint32, all bool) error {
