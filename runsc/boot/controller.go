@@ -41,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateipc"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/unet"
@@ -708,6 +709,13 @@ func (cm *containerManager) SetCPUCount(args *sentryapi.SetCPUCountArgs, _ *stru
 		return fmt.Errorf("SetCPUCount: invalid NumCPU %d", args.NumCPU)
 	}
 	return cm.l.k.SetApplicationCores(uint(args.NumCPU))
+}
+
+// SetTotalMemory pushes a live cgroup memory limit change into the running
+// sentry, without restarting the sandbox.
+func (cm *containerManager) SetTotalMemory(args *sentryapi.SetTotalMemoryArgs, _ *struct{}) error {
+	log.Debugf("containerManager.SetTotalMemory: %d", args.TotalMem)
+	return usage.SetTotalMemoryBytes(args.TotalMem)
 }
 
 // Wait waits for the init process in the given container.

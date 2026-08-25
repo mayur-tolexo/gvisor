@@ -333,3 +333,13 @@ type SetCPUCountArgs struct {
 	// NumCPU is the new number of CPUs to expose to the application.
 	NumCPU int32
 }
+
+// ContMgrSetTotalMemory updates the total memory reported inside the sandbox,
+// without a restart.
+const ContMgrSetTotalMemory = "containerManager.SetTotalMemory"
+
+// SetTotalMemoryArgs are arguments to the SetTotalMemory method.
+type SetTotalMemoryArgs struct {
+	// TotalMem is the new total memory, in bytes, to report to applications.
+	TotalMem uint64
+}

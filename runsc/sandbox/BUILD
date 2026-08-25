@@ -69,6 +69,7 @@ go_test(
     size = "small",
     srcs = [
         "cpu_test.go",
+        "memory_test.go",
         "metrics_test.go",
         "network_test.go",
         "sandbox_test.go",
