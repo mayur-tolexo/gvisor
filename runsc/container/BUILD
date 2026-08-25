@@ -116,6 +116,16 @@ go_test(
 )
 
 go_test(
+    name = "update_test",
+    size = "small",
+    srcs = ["update_test.go"],
+    library = ":container",
+    deps = [
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
+)
+
+go_test(
     name = "gofer_env_test",
     srcs = ["gofer_env_test.go"],
     embed = [":container"],
