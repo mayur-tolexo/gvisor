@@ -81,6 +81,8 @@ type Container struct {
 
 	// restoreDirect controls runsc restore --direct.
 	restoreDirect bool
+	// restoreBackground controls runsc restore --background.
+	restoreBackground bool
 
 	// saveRestoreExecArgv, if set, is passed to `runsc checkpoint
 	// --save-restore-exec-argv`: a hook runsc runs inside the sandbox before
