@@ -130,3 +130,42 @@ func TestCheckpointOptsArgs(t *testing.T) {
 		})
 	}
 }
+
+// TestRestoreOptsArgs verifies each restore flag is emitted only when set, so
+// that a pod asking for lazy page loading actually gets `runsc restore
+// --background`.
+func TestRestoreOptsArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts RestoreOpts
+		want []string
+	}{
+		{
+			name: "empty",
+			opts: RestoreOpts{},
+			want: nil,
+		},
+		{
+			name: "image-path",
+			opts: RestoreOpts{ImagePath: "/img"},
+			want: []string{"--image-path=/img"},
+		},
+		{
+			name: "background",
+			opts: RestoreOpts{ImagePath: "/img", Background: true},
+			want: []string{"--image-path=/img", "--background"},
+		},
+		{
+			name: "detach-direct-background",
+			opts: RestoreOpts{ImagePath: "/img", Detach: true, Direct: true, Background: true},
+			want: []string{"--image-path=/img", "--detach", "--direct", "--background"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.opts.args()
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("args() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

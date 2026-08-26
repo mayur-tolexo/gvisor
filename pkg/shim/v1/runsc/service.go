@@ -198,6 +198,12 @@ const (
 	RestoreHostPathAnnotation = "dev.gvisor.internal.restore.host-image-path"
 	// RestoreDirectAnnotation enables runsc restore --direct. Shim-only, stripped.
 	RestoreDirectAnnotation = "dev.gvisor.internal.restore.direct"
+	// RestoreBackgroundAnnotation enables runsc restore --background, which
+	// returns once the pages metadata is read and streams the pages in behind
+	// the running application instead of blocking the restore on all of them.
+	// Only has an effect on an uncompressed checkpoint (one with a separate
+	// pages file); on a compressed one runsc ignores it. Shim-only, stripped.
+	RestoreBackgroundAnnotation = "dev.gvisor.internal.restore.background"
 
 	// CheckpointSaveRestoreExecArgvAnnotation configures a hook runsc execs in
 	// the sandbox around save/restore. It is owned by the application-driven
@@ -249,6 +255,7 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		ctype                  string
 		restoreHostPath        string
 		restoreDirect          bool
+		restoreBackground      bool
 		saveRestoreExecArgv    string
 		saveRestoreExecTimeout string
 	)
@@ -258,6 +265,7 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 			restoreHostPath = p
 		}
 		restoreDirect = spec.Annotations[RestoreDirectAnnotation] == "true"
+		restoreBackground = spec.Annotations[RestoreBackgroundAnnotation] == "true"
 		// Read (but do not strip) the save-restore-exec annotation: the sentry
 		// also consumes it for the workload-triggered path.
 		saveRestoreExecArgv = spec.Annotations[CheckpointSaveRestoreExecArgvAnnotation]
@@ -299,7 +307,8 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 	if specErr == nil && spec != nil && restoreHostPath != "" {
 		c.restoreHostImagePath = restoreHostPath
 		c.restoreDirect = restoreDirect
-		log.L.Debugf("Container %s flagged for restore from host-image-path=%s (direct=%v, type=%s)", rfs.Create.ID, c.restoreHostImagePath, c.restoreDirect, ctype)
+		c.restoreBackground = restoreBackground
+		log.L.Debugf("Container %s flagged for restore from host-image-path=%s (direct=%v, background=%v, type=%s)", rfs.Create.ID, c.restoreHostImagePath, c.restoreDirect, c.restoreBackground, ctype)
 	}
 	// The save/restore-exec hook applies to the checkpoint side and is
 	// independent of restore, so it is recorded for every container that sets
@@ -368,8 +377,9 @@ func (s *runscService) Start(ctx context.Context, r *task.StartRequest) (*task.S
 		p, err = c.Restore(ctx, &extension.RestoreRequest{
 			Start: r,
 			Conf: extension.RestoreConfig{
-				ImagePath: path,
-				Direct:    c.restoreDirect,
+				ImagePath:  path,
+				Direct:     c.restoreDirect,
+				Background: c.restoreBackground,
 			},
 		})
 	} else {

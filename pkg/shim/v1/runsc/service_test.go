@@ -37,6 +37,7 @@ func TestStripGVisorRestoreAnnotations(t *testing.T) {
 		Annotations: map[string]string{
 			RestoreHostPathAnnotation:                  "/var/lib/criu-dumps/runsc-test",
 			RestoreDirectAnnotation:                    "true",
+			RestoreBackgroundAnnotation:                "true",
 			"dev.gvisor.internal.restore.extra":        "ignored",
 			CheckpointSaveRestoreExecArgvAnnotation:    "/usr/local/bin/gvisor-cuda-hook",
 			CheckpointSaveRestoreExecTimeoutAnnotation: "10m",
@@ -52,6 +53,7 @@ func TestStripGVisorRestoreAnnotations(t *testing.T) {
 	for _, key := range []string{
 		RestoreHostPathAnnotation,
 		RestoreDirectAnnotation,
+		RestoreBackgroundAnnotation,
 		"dev.gvisor.internal.restore.extra",
 	} {
 		if _, ok := spec.Annotations[key]; ok {
