@@ -45,6 +45,9 @@ type RestoreConfig struct {
 	ImagePath  string
 	Direct     bool
 	Background bool
+	// NoBackground passes --background=false, since runsc now defaults to
+	// background restore. Ignored when Background is set.
+	NoBackground bool
 }
 
 // Process is the interface representing a process inside the container.

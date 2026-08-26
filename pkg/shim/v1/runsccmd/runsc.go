@@ -266,6 +266,9 @@ type RestoreOpts struct {
 	Detach     bool
 	Direct     bool
 	Background bool
+	// NoBackground passes --background=false, since runsc now defaults to
+	// background restore. Ignored when Background is set.
+	NoBackground bool
 }
 
 func (o *RestoreOpts) args() []string {
@@ -281,6 +284,8 @@ func (o *RestoreOpts) args() []string {
 	}
 	if o.Background {
 		out = append(out, "--background")
+	} else if o.NoBackground {
+		out = append(out, "--background=false")
 	}
 	return out
 }
