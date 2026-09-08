@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	taskServer "gvisor.dev/gvisor/pkg/shim/v1/taskserver"
 	pb "gvisor.dev/gvisor/pkg/shim/v1/taskserver/task_server_go_proto"
@@ -188,9 +189,137 @@ func (s *runscService) Create(ctx context.Context, r *task.CreateTaskRequest) (*
 
 // CreateWithFSRestore is the same as Create, but it additionally restores the
 // container's filesystem from a snapshot.
+const (
+	// RestoreHostPathAnnotation, when set on the OCI runtime spec, makes the shim
+	// dispatch the next Start RPC to runsc restore instead of runsc start. Value
+	// is an absolute host path containing pages.img/checkpoint.img. This is a
+	// shim-only annotation: it is consumed here and stripped before runsc sees
+	// the spec.
+	RestoreHostPathAnnotation = "dev.gvisor.internal.restore.host-image-path"
+	// RestoreDirectAnnotation enables runsc restore --direct. Shim-only, stripped.
+	RestoreDirectAnnotation = "dev.gvisor.internal.restore.direct"
+	// RestoreBackgroundAnnotation enables runsc restore --background, which
+	// returns once the pages metadata is read and streams the pages in behind
+	// the running application instead of blocking the restore on all of them.
+	// Only has an effect on an uncompressed checkpoint (one with a separate
+	// pages file); on a compressed one runsc ignores it. Shim-only, stripped.
+	RestoreBackgroundAnnotation = "dev.gvisor.internal.restore.background"
+
+	// RestoreFSImagePathAnnotation makes the shim create the pod sandbox with
+	// runsc create --fs-restore-image-path, from an absolute host path holding a
+	// runsc fscheckpoint image. Shim-only, stripped like the other restore.* keys.
+	// The image keys its paths by container name, so those must match the capture.
+	RestoreFSImagePathAnnotation = "dev.gvisor.internal.restore.fs-image-path"
+	// RestoreFSDirectAnnotation enables runsc create --fs-restore-direct.
+	// Shim-only, stripped. Ignored without an image path.
+	RestoreFSDirectAnnotation = "dev.gvisor.internal.restore.fs-direct"
+
+	// CheckpointSaveRestoreExecArgvAnnotation configures a hook runsc execs in
+	// the sandbox around save/restore. It is owned by the application-driven
+	// checkpoint support (PR #13537), read at boot for the workload-triggered
+	// path. The shim ALSO reads it to pass `runsc checkpoint
+	// --save-restore-exec-argv` on the external (kubelet/CRI) checkpoint path,
+	// since the boot annotation is only honored for the workload trigger. Unlike
+	// the restore.* annotations, this is NOT stripped — the sentry needs it.
+	//
+	// Scope/limitations:
+	//   - On the external path the hook runs only in the namespaces of the
+	//     container being checkpointed; it cannot reach sibling containers.
+	//   - `runsc checkpoint` always snapshots the whole sandbox regardless of the
+	//     requested container id (see Checkpoint).
+	//   - The hook binary is operator-supplied (in the container image); gVisor
+	//     ships only this plumbing. It must honor the save-restore-exec contract:
+	//     reads GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE (save|restore|resume),
+	//     non-zero exit fails the checkpoint/restore.
+	CheckpointSaveRestoreExecArgvAnnotation = "dev.gvisor.internal.checkpoint.save-restore-exec-argv"
+	// CheckpointSaveRestoreExecTimeoutAnnotation optionally bounds that hook; its
+	// value is a Go duration string (e.g. "10m"). Ignored without the argv.
+	CheckpointSaveRestoreExecTimeoutAnnotation = "dev.gvisor.internal.checkpoint.save-restore-exec-timeout"
+
+	// restoreAnnotationPrefix is the prefix of shim-only restore annotations
+	// that must be stripped before runsc sees the spec.
+	restoreAnnotationPrefix = "dev.gvisor.internal.restore."
+)
+
+// stripGVisorRestoreAnnotations removes shim-only restore annotations so they do
+// not reach runsc. It deliberately leaves dev.gvisor.internal.checkpoint.*
+// intact, since those are consumed by the sentry (PR #13537).
+func stripGVisorRestoreAnnotations(spec *specs.Spec) {
+	if spec == nil || len(spec.Annotations) == 0 {
+		return
+	}
+	for k := range spec.Annotations {
+		if strings.HasPrefix(k, restoreAnnotationPrefix) {
+			delete(spec.Annotations, k)
+		}
+	}
+}
+
+// fsRestoreFromSpec reports the filesystem checkpoint a spec asks to restore from.
+// Honored only for a pod sandbox: runsc rejects the flag for a container joining an
+// existing sandbox, and CRI copies pod annotations onto every container's spec. A
+// spec with no container type is its own sandbox.
+func fsRestoreFromSpec(spec *specs.Spec) (string, bool, error) {
+	if spec == nil {
+		return "", false, nil
+	}
+	path := spec.Annotations[RestoreFSImagePathAnnotation]
+	if path == "" || !utils.IsSandbox(spec) {
+		return "", false, nil
+	}
+	// A memory checkpoint already carries the filesystem, so asking for both says
+	// two different things about where the files come from.
+	if spec.Annotations[RestoreHostPathAnnotation] != "" {
+		return "", false, fmt.Errorf("%s and %s are mutually exclusive", RestoreFSImagePathAnnotation, RestoreHostPathAnnotation)
+	}
+	return path, spec.Annotations[RestoreFSDirectAnnotation] == "true", nil
+}
+
 func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.CreateWithFSRestoreRequest) (*task.CreateTaskResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	spec, specErr := utils.ReadSpec(rfs.Create.Bundle)
+	var (
+		ctype                  string
+		restoreHostPath        string
+		restoreDirect          bool
+		restoreBackground      bool
+		saveRestoreExecArgv    string
+		saveRestoreExecTimeout string
+	)
+	fsImagePath, fsDirect := rfs.Conf.ImagePath, rfs.Conf.Direct
+	if specErr == nil && spec != nil {
+		ctype = spec.Annotations["io.kubernetes.cri.container-type"]
+		if p, ok := spec.Annotations[RestoreHostPathAnnotation]; ok && p != "" {
+			restoreHostPath = p
+		}
+		restoreDirect = spec.Annotations[RestoreDirectAnnotation] == "true"
+		restoreBackground = spec.Annotations[RestoreBackgroundAnnotation] == "true"
+		// Read (but do not strip) the save-restore-exec annotation: the sentry
+		// also consumes it for the workload-triggered path.
+		saveRestoreExecArgv = spec.Annotations[CheckpointSaveRestoreExecArgvAnnotation]
+		if v := spec.Annotations[CheckpointSaveRestoreExecTimeoutAnnotation]; v != "" {
+			// Validate here so a malformed duration fails the create instead of the
+			// checkpoint; runsc takes the string as written.
+			if _, err := time.ParseDuration(v); err != nil {
+				return nil, fmt.Errorf("invalid %s=%q: %w", CheckpointSaveRestoreExecTimeoutAnnotation, v, err)
+			}
+			saveRestoreExecTimeout = v
+		}
+		// The request wins: an explicit caller is not overridden by the pod's spec.
+		if fsImagePath == "" {
+			p, direct, err := fsRestoreFromSpec(spec)
+			if err != nil {
+				return nil, err
+			}
+			fsImagePath, fsDirect = p, direct
+		}
+		stripGVisorRestoreAnnotations(spec)
+		if err := utils.WriteSpec(rfs.Create.Bundle, spec); err != nil {
+			return nil, fmt.Errorf("write stripped restore annotations: %w", err)
+		}
+	}
 
 	c, err := NewContainer(ctx, s.platform, &ContainerConfig{
 		ID:                 rfs.Create.ID,
@@ -201,11 +330,31 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		Stdin:              rfs.Create.Stdin,
 		Stdout:             rfs.Create.Stdout,
 		Stderr:             rfs.Create.Stderr,
-		FSRestoreImagePath: rfs.Conf.ImagePath,
-		FSRestoreDirect:    rfs.Conf.Direct,
+		FSRestoreImagePath: fsImagePath,
+		FSRestoreDirect:    fsDirect,
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// Detect gVisor checkpoint annotations in OCI spec. host-image-path points
+	// at files on the node and applies to the pod sandbox too, letting kubelet
+	// start the sandbox via runsc restore; subsequent workload starts are
+	// translated by runsc into subcontainer restores while the sandbox is in
+	// restoringUnstarted.
+	if specErr == nil && spec != nil && restoreHostPath != "" {
+		c.restoreHostImagePath = restoreHostPath
+		c.restoreDirect = restoreDirect
+		c.restoreBackground = restoreBackground
+		log.L.Debugf("Container %s flagged for restore from host-image-path=%s (direct=%v, background=%v, type=%s)", rfs.Create.ID, c.restoreHostImagePath, c.restoreDirect, c.restoreBackground, ctype)
+	}
+	// The save/restore-exec hook applies to the checkpoint side and is
+	// independent of restore, so it is recorded for every container that sets
+	// it (not gated on host-image-path).
+	if saveRestoreExecArgv != "" {
+		c.saveRestoreExecArgv = saveRestoreExecArgv
+		c.saveRestoreExecTimeout = saveRestoreExecTimeout
+		log.L.Debugf("Container %s save/restore-exec hook: argv=%q timeout=%v", rfs.Create.ID, c.saveRestoreExecArgv, c.saveRestoreExecTimeout)
 	}
 
 	s.containers[rfs.Create.ID] = c
@@ -256,7 +405,24 @@ func (s *runscService) Start(ctx context.Context, r *task.StartRequest) (*task.S
 	if err != nil {
 		return nil, err
 	}
-	p, err := c.Start(ctx, r)
+	// A Start RPC for a container created with a gVisor checkpoint annotation
+	// is served as a restore: kubelet's CRI restore flow creates the container
+	// from a checkpoint image and issues the standard Start RPC, so the dispatch
+	// to runsc restore happens here rather than via the native Restore RPC.
+	var p extension.Process
+	if path, ok := c.pendingRestore(r.ExecID); ok {
+		log.L.Debugf("Start: dispatching to Restore (host-image-path=%s)", path)
+		p, err = c.Restore(ctx, &extension.RestoreRequest{
+			Start: r,
+			Conf: extension.RestoreConfig{
+				ImagePath:  path,
+				Direct:     c.restoreDirect,
+				Background: c.restoreBackground,
+			},
+		})
+	} else {
+		p, err = c.Start(ctx, r)
+	}
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
 	}
@@ -474,9 +640,39 @@ func (s *runscService) CloseIO(ctx context.Context, r *task.CloseIORequest) (*ty
 	return empty, nil
 }
 
-// Checkpoint checkpoints the container.
+// Checkpoint checkpoints the container by invoking `runsc checkpoint`
+// and writing the resulting images to r.Path. kubelet's CheckpointContainer
+// CRI flow (e.g. POST /checkpoint/<ns>/<pod>/<ctr>) routes here.
+//
+// Note: `runsc checkpoint` always snapshots the entire sandbox regardless of
+// r.ID — runsc has no single-container checkpoint. So checkpointing one
+// container of a multi-container pod captures the whole sandbox. The
+// save-restore-exec hook (if set via annotation) still runs only in r.ID's
+// namespaces; see CheckpointSaveRestoreExecArgvAnnotation.
 func (s *runscService) Checkpoint(ctx context.Context, r *task.CheckpointTaskRequest) (*types.Empty, error) {
-	return empty, errdefs.ErrNotImplemented
+	c, err := s.getContainer(r.ID)
+	if err != nil {
+		return empty, err
+	}
+	if c.task == nil {
+		return empty, fmt.Errorf("container %s has no task", r.ID)
+	}
+	if r.Path == "" {
+		return empty, fmt.Errorf("checkpoint Path is empty")
+	}
+	if err := os.MkdirAll(r.Path, 0o755); err != nil {
+		return empty, fmt.Errorf("mkdir %s: %w", r.Path, err)
+	}
+	log.L.Debugf("Checkpoint: id=%s path=%s", r.ID, r.Path)
+	if err := c.task.Runtime().Checkpoint(ctx, r.ID, &runsccmd.CheckpointOpts{
+		ImagePath:              r.Path,
+		LeaveRunning:           true,
+		SaveRestoreExecArgv:    c.saveRestoreExecArgv,
+		SaveRestoreExecTimeout: c.saveRestoreExecTimeout,
+	}); err != nil {
+		return empty, fmt.Errorf("runsc checkpoint: %w", err)
+	}
+	return empty, nil
 }
 
 // Restore restores the container.

@@ -103,6 +103,140 @@ func TestContainerUpdateNilResources(t *testing.T) {
 	}
 }
 
+func TestStripGVisorRestoreAnnotations(t *testing.T) {
+	spec := &specs.Spec{
+		Annotations: map[string]string{
+			RestoreHostPathAnnotation:                  "/var/lib/criu-dumps/runsc-test",
+			RestoreDirectAnnotation:                    "true",
+			RestoreBackgroundAnnotation:                "true",
+			"dev.gvisor.internal.restore.extra":        "ignored",
+			CheckpointSaveRestoreExecArgvAnnotation:    "/usr/local/bin/gvisor-cuda-hook",
+			CheckpointSaveRestoreExecTimeoutAnnotation: "10m",
+			utils.ContainerTypeAnnotation:              "sandbox",
+			"dev.gvisor.keep":                          "yes",
+			"example.com/annotation":                   "kept",
+		},
+	}
+
+	stripGVisorRestoreAnnotations(spec)
+
+	// restore.* annotations are shim-only and must be stripped.
+	for _, key := range []string{
+		RestoreHostPathAnnotation,
+		RestoreDirectAnnotation,
+		RestoreBackgroundAnnotation,
+		"dev.gvisor.internal.restore.extra",
+	} {
+		if _, ok := spec.Annotations[key]; ok {
+			t.Errorf("stripGVisorRestoreAnnotations kept %q", key)
+		}
+	}
+	// checkpoint.* (and everything else) must survive — the sentry consumes the
+	// save-restore-exec annotations.
+	for key, want := range map[string]string{
+		CheckpointSaveRestoreExecArgvAnnotation:    "/usr/local/bin/gvisor-cuda-hook",
+		CheckpointSaveRestoreExecTimeoutAnnotation: "10m",
+		utils.ContainerTypeAnnotation:              "sandbox",
+		"dev.gvisor.keep":                          "yes",
+		"example.com/annotation":                   "kept",
+	} {
+		if got := spec.Annotations[key]; got != want {
+			t.Errorf("stripGVisorRestoreAnnotations annotation %q = %q, want %q", key, got, want)
+		}
+	}
+}
+
+// TestFSRestoreFromSpec covers the gate that decides whether a pod's filesystem
+// checkpoint is applied. The container case is the one that breaks a whole pod: CRI
+// copies pod annotations onto every container's spec, and runsc rejects the flag for
+// a container joining an existing sandbox.
+func TestFSRestoreFromSpec(t *testing.T) {
+	const image = "/var/lib/sandbox-snapshots/fs/abc"
+
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		wantPath    string
+		wantDirect  bool
+		wantErr     bool
+	}{
+		{
+			name: "pod sandbox restores",
+			annotations: map[string]string{
+				RestoreFSImagePathAnnotation:  image,
+				RestoreFSDirectAnnotation:     "true",
+				utils.ContainerTypeAnnotation: "sandbox",
+			},
+			wantPath:   image,
+			wantDirect: true,
+		},
+		{
+			name: "workload container does not",
+			annotations: map[string]string{
+				RestoreFSImagePathAnnotation:  image,
+				utils.ContainerTypeAnnotation: "container",
+			},
+		},
+		{
+			name:        "no container type is its own sandbox",
+			annotations: map[string]string{RestoreFSImagePathAnnotation: image},
+			wantPath:    image,
+		},
+		{
+			name: "direct defaults off",
+			annotations: map[string]string{
+				RestoreFSImagePathAnnotation:  image,
+				RestoreFSDirectAnnotation:     "yes",
+				utils.ContainerTypeAnnotation: "sandbox",
+			},
+			wantPath: image,
+		},
+		{
+			name:        "direct alone does nothing",
+			annotations: map[string]string{RestoreFSDirectAnnotation: "true"},
+		},
+		{
+			name: "memory restore is mutually exclusive",
+			annotations: map[string]string{
+				RestoreFSImagePathAnnotation:  image,
+				RestoreHostPathAnnotation:     "/var/lib/criu-dumps/x",
+				utils.ContainerTypeAnnotation: "sandbox",
+			},
+			wantErr: true,
+		},
+		{name: "absent", annotations: map[string]string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, direct, err := fsRestoreFromSpec(&specs.Spec{Annotations: tc.annotations})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("fsRestoreFromSpec = (%q, %v, nil), want an error", path, direct)
+				}
+				if path != "" {
+					t.Errorf("fsRestoreFromSpec returned path %q alongside an error", path)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("fsRestoreFromSpec: %v", err)
+			}
+			if path != tc.wantPath {
+				t.Errorf("path = %q, want %q", path, tc.wantPath)
+			}
+			if direct != tc.wantDirect {
+				t.Errorf("direct = %v, want %v", direct, tc.wantDirect)
+			}
+		})
+	}
+}
+
+// A nil spec is the read-failed path in CreateWithFSRestore, which must not panic.
+func TestFSRestoreFromSpecNil(t *testing.T) {
+	if path, direct, err := fsRestoreFromSpec(nil); path != "" || direct || err != nil {
+		t.Errorf("fsRestoreFromSpec(nil) = (%q, %v, %v), want empty", path, direct, err)
+	}
+}
+
 func TestCgroupPath(t *testing.T) {
 	for _, tc := range []struct {
 		name string
