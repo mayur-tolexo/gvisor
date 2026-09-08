@@ -199,6 +199,15 @@ const (
 	// RestoreDirectAnnotation enables runsc restore --direct. Shim-only, stripped.
 	RestoreDirectAnnotation = "dev.gvisor.internal.restore.direct"
 
+	// RestoreFSImagePathAnnotation makes the shim create the pod sandbox with
+	// runsc create --fs-restore-image-path, from an absolute host path holding a
+	// runsc fscheckpoint image. Shim-only, stripped like the other restore.* keys.
+	// The image keys its paths by container name, so those must match the capture.
+	RestoreFSImagePathAnnotation = "dev.gvisor.internal.restore.fs-image-path"
+	// RestoreFSDirectAnnotation enables runsc create --fs-restore-direct.
+	// Shim-only, stripped. Ignored without an image path.
+	RestoreFSDirectAnnotation = "dev.gvisor.internal.restore.fs-direct"
+
 	// CheckpointSaveRestoreExecArgvAnnotation configures a hook runsc execs in
 	// the sandbox around save/restore. It is owned by the application-driven
 	// checkpoint support (PR #13537), read at boot for the workload-triggered
@@ -240,6 +249,26 @@ func stripGVisorRestoreAnnotations(spec *specs.Spec) {
 	}
 }
 
+// fsRestoreFromSpec reports the filesystem checkpoint a spec asks to restore from.
+// Honored only for a pod sandbox: runsc rejects the flag for a container joining an
+// existing sandbox, and CRI copies pod annotations onto every container's spec. A
+// spec with no container type is its own sandbox.
+func fsRestoreFromSpec(spec *specs.Spec) (string, bool, error) {
+	if spec == nil {
+		return "", false, nil
+	}
+	path := spec.Annotations[RestoreFSImagePathAnnotation]
+	if path == "" || !utils.IsSandbox(spec) {
+		return "", false, nil
+	}
+	// A memory checkpoint already carries the filesystem, so asking for both says
+	// two different things about where the files come from.
+	if spec.Annotations[RestoreHostPathAnnotation] != "" {
+		return "", false, fmt.Errorf("%s and %s are mutually exclusive", RestoreFSImagePathAnnotation, RestoreHostPathAnnotation)
+	}
+	return path, spec.Annotations[RestoreFSDirectAnnotation] == "true", nil
+}
+
 func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.CreateWithFSRestoreRequest) (*task.CreateTaskResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -252,6 +281,7 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		saveRestoreExecArgv    string
 		saveRestoreExecTimeout string
 	)
+	fsImagePath, fsDirect := rfs.Conf.ImagePath, rfs.Conf.Direct
 	if specErr == nil && spec != nil {
 		ctype = spec.Annotations["io.kubernetes.cri.container-type"]
 		if p, ok := spec.Annotations[RestoreHostPathAnnotation]; ok && p != "" {
@@ -269,6 +299,14 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 			}
 			saveRestoreExecTimeout = v
 		}
+		// The request wins: an explicit caller is not overridden by the pod's spec.
+		if fsImagePath == "" {
+			p, direct, err := fsRestoreFromSpec(spec)
+			if err != nil {
+				return nil, err
+			}
+			fsImagePath, fsDirect = p, direct
+		}
 		stripGVisorRestoreAnnotations(spec)
 		if err := utils.WriteSpec(rfs.Create.Bundle, spec); err != nil {
 			return nil, fmt.Errorf("write stripped restore annotations: %w", err)
@@ -284,8 +322,8 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		Stdin:              rfs.Create.Stdin,
 		Stdout:             rfs.Create.Stdout,
 		Stderr:             rfs.Create.Stderr,
-		FSRestoreImagePath: rfs.Conf.ImagePath,
-		FSRestoreDirect:    rfs.Conf.Direct,
+		FSRestoreImagePath: fsImagePath,
+		FSRestoreDirect:    fsDirect,
 	})
 	if err != nil {
 		return nil, err
