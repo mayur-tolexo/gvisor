@@ -265,7 +265,7 @@ func (c *controller) registerHandlers() {
 // refreshHandlers resets the server and re-registers all handlers using l.
 // Useful when l.k has been replaced (e.g. during a restore).
 func (c *controller) refreshHandlers() {
-	c.srv.ResetServer()
+	c.srv.ResetServer(c.stopRPCTimeout)
 	c.registerHandlers()
 }
 

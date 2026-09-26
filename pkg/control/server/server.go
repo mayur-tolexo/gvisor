@@ -59,10 +59,15 @@ func New(socket *unet.ServerSocket) *Server {
 }
 
 // ResetServer resets the server, clearing all registered objects. It stops the
-// old server asynchronously.
-func (s *Server) ResetServer() {
+// old server asynchronously, giving in-flight RPCs up to timeout to finish.
+//
+// A zero timeout closes every idle client at once, and a client counts as idle
+// until its request has been read off the wire, so a call still arriving is cut
+// mid-read and its caller sees EOF rather than a reply. Restore reaches here
+// while subcontainer restores are in flight, which is exactly that case.
+func (s *Server) ResetServer(timeout time.Duration) {
 	if old := s.server.Swap(urpc.NewServer()); old != nil {
-		go old.Stop(0)
+		go old.Stop(timeout)
 	}
 }
 
