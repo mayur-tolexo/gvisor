@@ -1124,6 +1124,19 @@ const sentryExeFD = 3
 
 // LINT.ThenChange(../prewarmer/prewarmer.c)
 
+// cpuQuotaFromResources returns the quota and period an update carries. Both
+// must be set, since the count comes from their ratio.
+func cpuQuotaFromResources(res *specs.LinuxResources) (cpuQuota, cpuPeriod int64, ok bool) {
+	if res == nil || res.CPU == nil || res.CPU.Quota == nil || res.CPU.Period == nil {
+		return 0, 0, false
+	}
+	cpuQuota, cpuPeriod = *res.CPU.Quota, int64(*res.CPU.Period)
+	if cpuQuota <= 0 || cpuPeriod <= 0 {
+		return 0, 0, false
+	}
+	return cpuQuota, cpuPeriod, true
+}
+
 // createSandboxProcess starts the sandbox as a subprocess by running the "boot"
 // command, passing in the bundle dir.
 func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
@@ -1785,7 +1798,13 @@ func calculateCPUNum(cg cgroup.Cgroup, cgCPUNum int, limits *CPULimits, cpuNumFr
 			return 0, 0, 0, fmt.Errorf("getting raw cpu period from cgroups: %v", err)
 		}
 	}
-	if cpuNumFromQuota && cpuQuota > 0 && cpuPeriod > 0 {
+	return limitCPUNumByQuota(cpuNum, cpuQuota, cpuPeriod, cpuNumFromQuota), cpuQuota, cpuPeriod, nil
+}
+
+// limitCPUNumByQuota lowers cpuNum to the count a cpu quota implies. Shared by
+// boot and live update so the two cannot disagree on the same quota.
+func limitCPUNumByQuota(cpuNum int, cpuQuota, cpuPeriod int64, enabled bool) int {
+	if enabled && cpuQuota > 0 && cpuPeriod > 0 {
 		// Dropping below 2 CPUs can trigger application to disable
 		// locks that can lead do hard to debug errors, so just
 		// leaving two cores as reasonable default.
@@ -1802,7 +1821,7 @@ func calculateCPUNum(cg cgroup.Cgroup, cgCPUNum int, limits *CPULimits, cpuNumFr
 			}
 		}
 	}
-	return cpuNum, cpuQuota, cpuPeriod, nil
+	return cpuNum
 }
 
 func rootMappedInContainer(IDMap []specs.LinuxIDMapping) bool {
@@ -2899,6 +2918,43 @@ func (s *Sandbox) Resume(cid string) error {
 		return fmt.Errorf("resuming container %q: %w", cid, err)
 	}
 	return nil
+}
+
+// SetCPUCount recomputes the CPU count and pushes it into the running sentry,
+// avoiding a sandbox restart. res is the update's resources, or nil to derive
+// the count from the cgroup alone.
+func (s *Sandbox) SetCPUCount(conf *config.Config, res *specs.LinuxResources) error {
+	cg := s.CgroupJSON.Cgroup
+	if cg == nil {
+		return nil
+	}
+	cpuNum, err := cpuNumForUpdate(cg, s.CPULimits, conf, res)
+	if err != nil {
+		return err
+	}
+	log.Debugf("Sandbox %q: setting cpu count to %d", s.ID, cpuNum)
+	args := &sentryapi.SetCPUCountArgs{NumCPU: int32(cpuNum)}
+	if err := s.call(sentryapi.ContMgrSetCPUCount, args, nil); err != nil {
+		return fmt.Errorf("setting cpu count: %w", err)
+	}
+	return nil
+}
+
+// cpuNumForUpdate derives the CPU count for an update, preferring the quota the
+// update carries over cg's. Under Kubernetes pod-level resources the kubelet
+// writes the quota to the pod cgroup and leaves the sandbox's own at max, so
+// reading cg would find none and silently keep the old count. cg still gives the
+// cpuset ceiling, which a quota change does not move. Without a quota in the
+// update, limits stands in for cg the same way it does at boot: cg may be
+// holding a creation or lifecycle limit rather than the application's.
+func cpuNumForUpdate(cg cgroup.Cgroup, limits *CPULimits, conf *config.Config, res *specs.LinuxResources) (int, error) {
+	cgCPUNum := cgroupCPUNum(cg)
+	cpuQuota, cpuPeriod, ok := cpuQuotaFromResources(res)
+	if !ok {
+		cpuNum, _, _, err := calculateCPUNum(cg, cgCPUNum, limits, conf.CPUNumFromQuota)
+		return cpuNum, err
+	}
+	return limitCPUNumByQuota(cgCPUNum, cpuQuota, cpuPeriod, conf.CPUNumFromQuota), nil
 }
 
 // Usage sends the collect call for a container in the sandbox.

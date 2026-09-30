@@ -784,6 +784,13 @@ func (c *Container) Update(conf *config.Config, res *specs.LinuxResources) error
 			}
 		}
 
+		// Push the re-derived CPU count into the sentry. Also for subcontainers:
+		// under Kubernetes only the subcontainer gets this call, and res is the only
+		// place its new quota appears. Best-effort; the cgroup is already set.
+		if err := c.Sandbox.SetCPUCount(conf, res); err != nil {
+			log.Warningf("Setting sandbox CPU count for container %q: %v", c.ID, err)
+		}
+
 		c.Spec.Linux.Resources = res
 		return nil
 	})
