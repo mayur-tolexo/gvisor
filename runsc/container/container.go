@@ -635,8 +635,17 @@ func Run(conf *config.Config, args Args) (unix.WaitStatus, error) {
 	return 0, nil
 }
 
+// memoryLimit returns the memory limit res sets, if any. A missing or
+// non-positive limit means unspecified or unlimited: no size to report.
+func memoryLimit(res *specs.LinuxResources) (uint64, bool) {
+	if res == nil || res.Memory == nil || res.Memory.Limit == nil || *res.Memory.Limit <= 0 {
+		return 0, false
+	}
+	return uint64(*res.Memory.Limit), true
+}
+
 // Update sets the resources of a running container as configured.
-func (c *Container) Update(res *specs.LinuxResources) error {
+func (c *Container) Update(conf *config.Config, res *specs.LinuxResources) error {
 	log.Debugf("Set resources for container, cid: %s", c.ID)
 	if err := c.requireStatus("set resources for", Created, Running); err != nil {
 		return err
@@ -657,6 +666,25 @@ func (c *Container) Update(res *specs.LinuxResources) error {
 				return fmt.Errorf("setting back cgroup configs failed due to error: %v, your state file and actual configs might be inconsistent", err2)
 			}
 			return err
+		}
+	}
+
+	// Push the re-derived CPU count into the sentry. Also for subcontainers:
+	// under Kubernetes only the subcontainer gets this call, and res is the only
+	// place its new quota appears. Best-effort; the cgroup is already set.
+	if err := c.Sandbox.SetCPUCount(conf, res); err != nil {
+		log.Warningf("Setting sandbox CPU count for container %q: %v", c.ID, err)
+	}
+
+	// Push the new limit into the sentry too, subcontainers included: under
+	// Kubernetes only the subcontainer gets this call. Skipped when unchanged,
+	// since update back-fills the current limit into every request, including
+	// CPU-only ones. Best-effort; the cgroup is already set.
+	if newLimit, ok := memoryLimit(res); ok {
+		if oldLimit, hadLimit := memoryLimit(c.Spec.Linux.Resources); !hadLimit || oldLimit != newLimit {
+			if err := c.Sandbox.SetTotalMemory(newLimit); err != nil {
+				log.Warningf("Setting sandbox total memory for container %q: %v", c.ID, err)
+			}
 		}
 	}
 
